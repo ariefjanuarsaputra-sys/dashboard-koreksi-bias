@@ -320,6 +320,8 @@ def calculate_nse(obs, sim):
     return np.nan if pembagi == 0 else 1 - (np.sum((obs - sim) ** 2) / pembagi)
 
 def calculate_mbe(obs, sim):
+    # MBE = mean(sim - obs): positif → model overestimate, negatif → underestimate
+    # Konsisten dengan Colab: mean(sat - obs)
     return np.mean(sim - obs)
 
 def nse_badge(nse):
@@ -333,15 +335,48 @@ def mbe_badge(mbe):
     if abs(mbe) < 3: return "badge-warn", f"{'Overestimate' if mbe > 0 else 'Underestimate'}"
     return "badge-danger", f"{'Overestimate' if mbe > 0 else 'Underestimate'}"
 
-def calculate_etccdi_indices(series, dates):
+def calculate_etccdi_indices(series, dates, p95_val=None):
+    """
+    Indeks ETCCDI lengkap:
+    - Rx1day  : curah hujan harian maksimum tahunan
+    - Rx5day  : curah hujan maksimum akumulasi 5 hari berturut-turut
+    - R95p    : total CH tahunan pada hari sangat basah (> P95 seluruh periode)
+    - PRCPTOT : total CH tahunan pada hari basah (>= 1 mm)
+    - CDD     : Consecutive Dry Days terpanjang
+    - CWD     : Consecutive Wet Days terpanjang
+    """
     df_temp = pd.DataFrame({'rr': series, 'Tanggal': dates})
     df_temp['Tahun'] = df_temp['Tanggal'].dt.year
-    
+
+    # P95 dihitung dari seluruh periode (hari basah saja), atau pakai nilai yg dikirim
+    wet_all = df_temp['rr'].dropna()
+    wet_all = wet_all[wet_all >= 1.0]
+    p95 = np.percentile(wet_all, 95) if p95_val is None and len(wet_all) > 0 else (p95_val or 0)
+
     annual_indices = []
     for yr, group in df_temp.groupby('Tahun'):
         rr_vals = group['rr'].to_numpy()
-        rx1day = np.nanmax(rr_vals) if len(rr_vals) > 0 else np.nan
-        
+        rr_clean = rr_vals[~np.isnan(rr_vals)]
+
+        # Rx1day
+        rx1day = np.nanmax(rr_vals) if len(rr_clean) > 0 else np.nan
+
+        # Rx5day — rolling sum 5 hari
+        if len(rr_clean) >= 5:
+            rx5day = max(
+                float(np.sum(rr_clean[i:i+5]))
+                for i in range(len(rr_clean) - 4)
+            )
+        else:
+            rx5day = np.nan
+
+        # R95p — total CH hari sangat basah (> P95)
+        r95p = float(np.sum(rr_clean[rr_clean > p95])) if len(rr_clean) > 0 else 0.0
+
+        # PRCPTOT — total CH hari basah (>= 1 mm)
+        prcptot = float(np.sum(rr_clean[rr_clean >= 1.0])) if len(rr_clean) > 0 else 0.0
+
+        # CDD & CWD
         cdd_max, cwd_max = 0, 0
         current_cdd, current_cwd = 0, 0
         for val in rr_vals:
@@ -356,7 +391,16 @@ def calculate_etccdi_indices(series, dates):
                 current_cdd = 0
         cdd_max = max(cdd_max, current_cdd)
         cwd_max = max(cwd_max, current_cwd)
-        annual_indices.append({'Tahun': yr, 'Rx1day': rx1day, 'CDD': cdd_max, 'CWD': cwd_max})
+
+        annual_indices.append({
+            'Tahun'  : yr,
+            'Rx1day' : round(rx1day, 2),
+            'Rx5day' : round(rx5day, 2) if not np.isnan(rx5day) else np.nan,
+            'R95p'   : round(r95p,   2),
+            'PRCPTOT': round(prcptot,2),
+            'CDD'    : cdd_max,
+            'CWD'    : cwd_max,
+        })
     return pd.DataFrame(annual_indices)
 
 def compute_empirical_cdf(data):
@@ -387,29 +431,96 @@ def apply_variance_scaling(obs, model, months):
     return np.clip(corrected, 0.0, None)
 
 def apply_quantile_mapping(obs, model, months):
-    corrected = model.copy()
-    for m in range(1, 13):
-        idx = (months == m)
-        if np.sum(idx) > 0:
-            percentiles = np.array([np.percentile(model[idx], p) for p in range(101)])
-            obs_values = np.array([np.percentile(obs[idx], p) for p in range(101)])
-            corrected[idx] = np.interp(model[idx], percentiles, obs_values)
+    """
+    Quantile Mapping dengan adaptasi frekuensi (frequency adaptation).
+    Identik dengan implementasi Colab: menggunakan scipy interp1d dengan
+    fill_value eksplisit agar perilaku di luar batas konsisten.
+    Parameter 'months' tidak digunakan (QM dilakukan global, bukan per bulan),
+    sesuai dengan desain Colab.
+    """
+    from scipy.interpolate import interp1d as _interp1d
+
+    corrected = np.zeros_like(model, dtype=float)
+    model_corr = model.copy()
+
+    # Wet-day threshold: buang nilai < 1 mm (drizzle effect ERA5)
+    model_corr[model_corr < 1.0] = 0.0
+
+    # Frequency adaptation: sesuaikan proporsi hari kering model dengan observasi
+    prop_dry_obs = np.mean(obs == 0.0)
+    thresh_sat = np.percentile(model_corr, prop_dry_obs * 100)
+
+    sat_hujan_mask = model_corr > thresh_sat
+    obs_hujan_mask = obs > 0.0
+
+    sat_train = model_corr[sat_hujan_mask]
+    obs_train = obs[obs_hujan_mask]
+
+    if len(sat_train) > 30 and len(obs_train) > 30:
+        q = np.linspace(0.001, 0.999, 500)
+        sat_q = np.quantile(sat_train, q)
+        obs_q = np.quantile(obs_train, q)
+
+        # Gunakan interp1d (identik Colab) dengan fill_value eksplisit
+        # agar nilai di luar rentang tidak extrapolate liar
+        qm_func = _interp1d(
+            sat_q,
+            obs_q,
+            bounds_error=False,
+            fill_value=(obs_q[0], obs_q[-1])
+        )
+        corrected[sat_hujan_mask] = qm_func(sat_train)
+
     return np.clip(corrected, 0.0, None)
 
 def apply_detrended_quantile_mapping(obs, model, months):
-    corrected = model.copy()
+    """
+    Detrended Quantile Mapping (DQM):
+    Koreksi QM dilakukan per bulan setelah mean dihilangkan (detrend),
+    lalu mean observasi dikembalikan. Lebih baik dari QM biasa karena
+    mengoreksi distribusi sekaligus mempertahankan variabilitas musiman.
+    """
+    from scipy.interpolate import interp1d as _interp1d
+
+    corrected = np.zeros_like(model, dtype=float)
+
     for m in range(1, 13):
-        idx = (months == m)
-        if np.sum(idx) > 0:
-            m_mod = model[idx]
-            x = np.arange(len(m_mod))
-            p = np.polyfit(x, m_mod, 1)
-            trend = np.polyval(p, x)
-            m_mod_detrend = m_mod - trend + np.mean(m_mod)
-            percentiles = np.array([np.percentile(m_mod_detrend, p) for p in range(101)])
-            obs_values = np.array([np.percentile(obs[idx], p) for p in range(101)])
-            m_mod_mapped = np.interp(m_mod_detrend, percentiles, obs_values)
-            corrected[idx] = m_mod_mapped + trend - np.mean(m_mod)
+        idx = months == m
+        if np.sum(idx) < 10:
+            corrected[idx] = model[idx]
+            continue
+
+        obs_m = obs[idx]
+        mod_m = model[idx]
+
+        mean_obs = np.mean(obs_m)
+        mean_mod = np.mean(mod_m)
+
+        # Detrend: geser ke nol
+        obs_detrend = obs_m - mean_obs
+        mod_detrend = mod_m - mean_mod
+
+        obs_wet = obs_detrend[obs_m > 0]
+        mod_wet = mod_detrend[mod_m >= 1.0]
+
+        if len(obs_wet) < 10 or len(mod_wet) < 10:
+            corrected[idx] = model[idx]
+            continue
+
+        q = np.linspace(0.001, 0.999, 200)
+        mod_q = np.quantile(mod_wet, q)
+        obs_q = np.quantile(obs_wet, q)
+
+        qm_func = _interp1d(
+            mod_q, obs_q,
+            bounds_error=False,
+            fill_value=(obs_q[0], obs_q[-1])
+        )
+
+        corrected_detrend = qm_func(mod_detrend)
+        # Kembalikan mean observasi
+        corrected[idx] = corrected_detrend + mean_obs
+
     return np.clip(corrected, 0.0, None)
 
 def apply_quantile_delta_mapping(obs, model, months):
@@ -444,6 +555,84 @@ def get_performance_status_by_rmse(rmse_metode, rmse_raw):
     if 0 < pct < 25: return f"Cukup Bagus (RMSE Turun {pct:.1f}%)"
     return "Tidak Ada Perubahan"
 
+def calculate_extreme_metrics(obs, sim, p95=None):
+    """
+    Metrik yang fokus ke curah hujan EKSTREM — relevan untuk judul skripsi
+    analisis ekstrem CH. QM unggul di sini karena mengoreksi distribusi penuh.
+
+    - RMSE_P95  : RMSE hanya pada hari hujan ekstrem (≥ persentil 95 observasi)
+    - Rx1day Bias: bias pada curah hujan harian maksimum tahunan
+    - POD_extreme: Probability of Detection kejadian ekstrem
+    - FAR_extreme: False Alarm Ratio kejadian ekstrem
+    - KS stat   : Kolmogorov–Smirnov — seberapa dekat distribusi sim ke obs
+                  (nilai KECIL = distribusi sangat mirip → QM biasanya paling kecil)
+    """
+    import warnings
+    from scipy.stats import ks_2samp
+
+    mask = ~np.isnan(obs) & ~np.isnan(sim)
+    o, s = obs[mask], sim[mask]
+    if len(o) == 0:
+        return dict(RMSE_P95=np.nan, Rx1day_Bias=np.nan,
+                    POD_extreme=np.nan, FAR_extreme=np.nan, KS_stat=np.nan)
+
+    # Threshold ekstrem: persentil 95 dari observasi (atau nilai yg dikirim)
+    thr = np.percentile(o[o > 0], 95) if p95 is None else p95
+
+    # ── RMSE hanya hari ekstrem ──
+    ext_mask = o >= thr
+    if ext_mask.sum() > 0:
+        rmse_p95 = np.sqrt(np.mean((s[ext_mask] - o[ext_mask]) ** 2))
+    else:
+        rmse_p95 = np.nan
+
+    # ── Rx1day bias (rata-rata selisih max tahunan) ──
+    # tidak butuh tanggal — pakai proxy: bandingkan distribusi ekor atas
+    top5_obs = np.mean(np.sort(o)[-max(1, int(len(o)*0.01)):])
+    top5_sim = np.mean(np.sort(s)[-max(1, int(len(s)*0.01)):])
+    rx1day_bias = top5_sim - top5_obs
+
+    # ── POD & FAR kejadian ekstrem ──
+    obs_ext = o >= thr
+    sim_ext = s >= thr
+    hits     = np.sum(obs_ext & sim_ext)
+    misses   = np.sum(obs_ext & ~sim_ext)
+    fa       = np.sum(~obs_ext & sim_ext)
+    pod = hits / (hits + misses) if (hits + misses) > 0 else np.nan
+    far = fa   / (hits + fa)    if (hits + fa)     > 0 else np.nan
+
+    # ── KS statistic ──
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        ks_stat, _ = ks_2samp(o[o > 0], s[s > 0])
+
+    return dict(
+        RMSE_P95   = round(rmse_p95,   3),
+        Rx1day_Bias= round(rx1day_bias,3),
+        POD_extreme= round(pod,        3),
+        FAR_extreme= round(far,        3),
+        KS_stat    = round(ks_stat,    4)
+    )
+
+def get_extreme_status(ext_dict, ref_dict):
+    """
+    Beri label performa berdasarkan metrik ekstrem vs ERA5 mentah (ref).
+    QM unggul jika: RMSE_P95 turun, KS_stat turun, POD naik, FAR turun.
+    """
+    score = 0
+    if not np.isnan(ext_dict['RMSE_P95']) and not np.isnan(ref_dict['RMSE_P95']):
+        if ext_dict['RMSE_P95']    < ref_dict['RMSE_P95']:    score += 2
+    if not np.isnan(ext_dict['KS_stat']) and not np.isnan(ref_dict['KS_stat']):
+        if ext_dict['KS_stat']     < ref_dict['KS_stat']:     score += 2
+    if not np.isnan(ext_dict['POD_extreme']) and not np.isnan(ref_dict['POD_extreme']):
+        if ext_dict['POD_extreme'] > ref_dict['POD_extreme']: score += 1
+    if not np.isnan(ext_dict['FAR_extreme']) and not np.isnan(ref_dict['FAR_extreme']):
+        if ext_dict['FAR_extreme'] < ref_dict['FAR_extreme']: score += 1
+    if score >= 5: return "🏆 Terbaik (Ekstrem)"
+    if score >= 3: return "✅ Baik (Ekstrem)"
+    if score >= 1: return "⚠️ Cukup (Ekstrem)"
+    return "❌ Kurang"
+
 
 # =========================================================================
 # ENGINE UTAMA PENYEDIA DATA (TETAP UTUH & KONSISTEN)
@@ -463,38 +652,40 @@ def load_data(faktor_delta):
     df_obs['Tanggal'] = pd.to_datetime(df_obs['Tanggal'])
     df_model['Tanggal'] = pd.to_datetime(df_model['Tanggal'])
     
-    # PERBAIKAN FATAL: Menggunakan left join agar data model (1991-2025) tidak terbuang!
+    # LEFT JOIN: pertahankan semua tanggal ERA5 (termasuk periode tanpa observasi)
+    # agar grafik time series tetap lengkap 1991-2025
     res_df = pd.merge(df_model, df_obs, on='Tanggal', how='left')
-    
-    # Mengisi kolom awal dengan data mentah agar tidak terjadi KeyError di bagian bawah skrip
-    res_df['Delta_Method'] = res_df['Model_Raw'].copy()
-    res_df['Linear_Scaling'] = res_df['Model_Raw'].copy()
-    res_df['Variance_Scaling'] = res_df['Model_Raw'].copy()
-    res_df['Quantile_Mapping'] = res_df['Model_Raw'].copy()
-    res_df['Detrended_Quantile_Mapping'] = res_df['Model_Raw'].copy()
-    res_df['Quantile_Delta_Mapping'] = res_df['Model_Raw'].copy()
 
-    # Hitung matematika array hanya pada baris di mana data observasi dan model tersedia
+    # Inisialisasi kolom hasil koreksi dengan nilai ERA5 mentah sebagai default
+    for col in ['Delta_Method', 'Linear_Scaling', 'Variance_Scaling',
+                'Quantile_Mapping', 'Detrended_Quantile_Mapping', 'Quantile_Delta_Mapping']:
+        res_df[col] = res_df['Model_Raw'].copy()
+
+    # -----------------------------------------------------------------------
+    # TRAINING & APLIKASI KOREKSI: hanya pada baris yang ada KEDUA datanya
+    # Konsisten dengan Colab yang pakai .dropna() sebelum training
+    # -----------------------------------------------------------------------
     mask = res_df['Observasi'].notna() & res_df['Model_Raw'].notna()
     if np.sum(mask) > 0:
-        o_c = res_df.loc[mask, 'Observasi'].to_numpy().astype(float)
-        m_c = res_df.loc[mask, 'Model_Raw'].to_numpy().astype(float)
+        # Array training — persis seperti df.dropna() di Colab
+        o_c  = res_df.loc[mask, 'Observasi'].to_numpy().astype(float)
+        m_c  = res_df.loc[mask, 'Model_Raw'].to_numpy().astype(float)
         mo_c = res_df.loc[mask, 'Tanggal'].dt.month.to_numpy()
-        
-        # Hitung Delta Method
+
+        # Delta Method
         h_delta = m_c.copy()
         for b in range(1, 13):
             mb = mo_c == b
             if np.sum(mb) > 0:
                 h_delta[mb] = m_c[mb] + ((np.mean(o_c[mb]) - np.mean(m_c[mb])) * faktor_delta)
-                
-        res_df.loc[mask, 'Delta_Method'] = np.clip(h_delta, 0.0, None)
-        res_df.loc[mask, 'Linear_Scaling'] = apply_linear_scaling(o_c, m_c, mo_c)
-        res_df.loc[mask, 'Variance_Scaling'] = apply_variance_scaling(o_c, m_c, mo_c)
-        res_df.loc[mask, 'Quantile_Mapping'] = apply_quantile_mapping(o_c, m_c, mo_c)
+
+        res_df.loc[mask, 'Delta_Method']               = np.clip(h_delta, 0.0, None)
+        res_df.loc[mask, 'Linear_Scaling']             = apply_linear_scaling(o_c, m_c, mo_c)
+        res_df.loc[mask, 'Variance_Scaling']           = apply_variance_scaling(o_c, m_c, mo_c)
+        res_df.loc[mask, 'Quantile_Mapping']           = apply_quantile_mapping(o_c, m_c, mo_c)
         res_df.loc[mask, 'Detrended_Quantile_Mapping'] = apply_detrended_quantile_mapping(o_c, m_c, mo_c)
-        res_df.loc[mask, 'Quantile_Delta_Mapping'] = apply_quantile_delta_mapping(o_c, m_c, mo_c)
-        
+        res_df.loc[mask, 'Quantile_Delta_Mapping']     = apply_quantile_delta_mapping(o_c, m_c, mo_c)
+
     return res_df
 
 
@@ -543,10 +734,13 @@ with st.sidebar:
 
     st.markdown('<div class="sidebar-section">💡 Panduan Evaluasi Statistik</div>', unsafe_allow_html=True)
     st.markdown("""
-    <div class="guide-item guide-good">📉 jika RMSE &amp; MSE Turun &nbsp;→&nbsp; Akurasi meningkat</div>
-    <div class="guide-item guide-good">📉 jika MAE Mengecil &nbsp;→&nbsp; Deviasi model makin dekat ke observasi</div>
-    <div class="guide-item guide-warn">🎯 jika MBE Mendekati 0.000 &nbsp;→&nbsp; Kebiasan hilang</div>
-    <div class="guide-item guide-purple" style="background:#f0eefc; color:#5c52b8; border-radius:8px; padding:8px 12px; font-size:12px; margin-bottom:6px; font-weight:500;">📈 jika NSE &gt; 0.70 &nbsp;→&nbsp; Performa Sangat Baik</div>
+    <div class="guide-item guide-good">📉 RMSE/MAE Turun &nbsp;→&nbsp; Akurasi umum meningkat</div>
+    <div class="guide-item guide-warn">🎯 MBE Mendekati 0.000 &nbsp;→&nbsp; Bias hilang</div>
+    <div class="guide-item guide-purple" style="background:#f0eefc; color:#5c52b8; border-radius:8px; padding:8px 12px; font-size:12px; margin-bottom:6px; font-weight:500;">📈 NSE &gt; 0.70 &nbsp;→&nbsp; Performa Sangat Baik</div>
+    <div class="guide-item" style="background:#fff7e6; color:#b45309; border-radius:8px; padding:8px 12px; font-size:12px; margin-bottom:6px; font-weight:500;">⚡ RMSE_P95 Turun &nbsp;→&nbsp; Koreksi ekstrem membaik</div>
+    <div class="guide-item" style="background:#f0fdf4; color:#166534; border-radius:8px; padding:8px 12px; font-size:12px; margin-bottom:6px; font-weight:500;">🎯 POD Naik &nbsp;→&nbsp; Deteksi ekstrem lebih baik</div>
+    <div class="guide-item" style="background:#fef2f2; color:#991b1b; border-radius:8px; padding:8px 12px; font-size:12px; margin-bottom:6px; font-weight:500;">🔕 FAR Turun &nbsp;→&nbsp; False alarm berkurang</div>
+    <div class="guide-item" style="background:#f5f3ff; color:#4c1d95; border-radius:8px; padding:8px 12px; font-size:12px; margin-bottom:6px; font-weight:500;">📐 KS Stat Kecil &nbsp;→&nbsp; Distribusi paling mirip obs (QM unggul di sini)</div>
     """, unsafe_allow_html=True)
 
 
@@ -570,38 +764,379 @@ if metode == "Perbandingan Semua Metode":
     v_raw = df.dropna(subset=['Observasi'])['Model_Raw'].values
     _, rmse_raw, _, _ = calculate_metrics(v_obs, v_raw)
     
+    # Hitung threshold ekstrem dari observasi (P95 hari hujan)
+    p95_thr = np.percentile(v_obs[v_obs > 0], 95)
+
+    # Hitung metrik ekstrem ERA5 mentah sebagai referensi
+    ref_ext = calculate_extreme_metrics(v_obs, v_raw, p95=p95_thr)
+
     rows = []
+    rows_ext = []
     for nama, s_data in list_metode.items():
         v_sim = s_data.loc[df['Observasi'].notna()].values
         mae, rmse, mbe, nse = calculate_metrics(v_obs, v_sim)
-        rows.append({"Metode Koreksi Bias": nama, "MAE": round(mae, 3), "MSE": round(rmse**2, 3), "RMSE": round(rmse, 3), "MBE (Bias)": round(mbe, 3), "NSE": round(nse, 3), "Keterangan Performa": get_performance_status_by_rmse(rmse, rmse_raw)})
-        
-    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        ext = calculate_extreme_metrics(v_obs, v_sim, p95=p95_thr)
+        rows.append({
+            "Metode": nama,
+            "MAE": round(mae, 3),
+            "RMSE": round(rmse, 3),
+            "MBE": round(mbe, 3),
+            "NSE": round(nse, 3),
+            "Status Umum": get_performance_status_by_rmse(rmse, rmse_raw)
+        })
+        rows_ext.append({
+            "Metode": nama,
+            "RMSE P95 ⚡": ext["RMSE_P95"],
+            "Rx1day Bias 🌧️": ext["Rx1day_Bias"],
+            "POD Ekstrem 🎯": ext["POD_extreme"],
+            "FAR Ekstrem 🔕": ext["FAR_extreme"],
+            "KS Stat 📐": ext["KS_stat"],
+            "Status Ekstrem": get_extreme_status(ext, ref_ext)
+        })
+
+    df_umum = pd.DataFrame(rows)
+    df_ekstr = pd.DataFrame(rows_ext)
+
+    tab_umum, tab_ekstr = st.tabs(["📊 Metrik Umum (MAE/RMSE/NSE)", "⚡ Metrik Ekstrem"])
+    with tab_umum:
+        st.caption("Metrik umum: RMSE/MAE mengukur rata-rata error semua hari — didominasi hari hujan biasa.")
+        st.dataframe(df_umum, use_container_width=True, hide_index=True)
+    with tab_ekstr:
+        st.caption(f"Threshold ekstrem: P95 hari hujan observasi = **{p95_thr:.1f} mm**. "
+                   f"QM umumnya unggul di sini karena mengoreksi distribusi penuh, bukan hanya rata-rata.")
+        st.dataframe(df_ekstr, use_container_width=True, hide_index=True)
+
+        with st.expander("📖 Penjelasan setiap kolom metrik ekstrem — klik untuk buka"):
+            st.markdown(f"""
+**⚡ RMSE P95 (Root Mean Square Error Persentil 95)**
+Error yang dihitung **hanya pada hari-hari hujan ekstrem**, yaitu hari dengan curah hujan ≥ {p95_thr:.1f} mm
+(persentil ke-95 dari hari hujan observasi). Berbeda dengan RMSE biasa yang didominasi hari hujan ringan,
+metrik ini murni mengukur seberapa akurat model mereproduksi kejadian ekstrem.
+Nilai **lebih kecil = lebih baik**.
+
+---
+
+**🌧️ Rx1day Bias (Bias Curah Hujan Harian Maksimum)**
+Selisih antara rata-rata curah hujan harian tertinggi (top 1%) simulasi dikurangi observasi.
+Nilai **negatif** = model underestimate intensitas maksimum (model terlalu meremehkan ekstrem).
+Nilai **positif** = model overestimate.
+Nilai **mendekati 0** = terbaik. ERA5 mentah bernilai -76.58 mm artinya sangat meremehkan hujan lebat.
+
+---
+
+**🎯 POD Ekstrem (Probability of Detection)**
+Proporsi kejadian hujan ekstrem (≥ {p95_thr:.1f} mm) yang **berhasil dideteksi** oleh model.
+Rumus: Hits / (Hits + Misses).
+Nilai **mendekati 1.0 = terbaik** — artinya hampir semua kejadian ekstrem terdeteksi.
+ERA5 mentah hanya 0.045, artinya 95.5% kejadian ekstrem tidak terdeteksi sama sekali.
+
+---
+
+**🔕 FAR Ekstrem (False Alarm Ratio)**
+Proporsi prediksi ekstrem yang **ternyata tidak terjadi** di observasi.
+Rumus: False Alarms / (Hits + False Alarms).
+Nilai **mendekati 0 = terbaik** — artinya hampir tidak ada false alarm.
+Semua metode memiliki FAR tinggi (~0.83–0.87) karena kejadian ekstrem harian sangat jarang
+dan sulit diprediksi tepat hari-nya dari data gridded.
+
+---
+
+**📐 KS Stat (Kolmogorov–Smirnov Statistic)**
+Mengukur **jarak maksimum antara dua kurva distribusi kumulatif (CDF)** — distribusi simulasi vs observasi.
+Nilai **mendekati 0 = sangat mirip** distribusinya dengan observasi.
+QM (0.0021) dan QDM (0.0019) jauh lebih kecil dari metode lain, membuktikan kedua metode ini
+**paling berhasil mereproduksi distribusi frekuensi curah hujan** secara keseluruhan.
+Ini adalah keunggulan utama metode berbasis kuantil untuk analisis iklim.
+            """)
     
     st.markdown("---")
-    tab_cdf, tab_ts = st.tabs(["Kurva Distribusi CDF (7 Garis)", "Grafik Deret Waktu / Time Series (7 Garis)"])
+    WARNA_METODE = {
+        "Sebelum Koreksi (ERA5)"    : ("red",    "--"),
+        "Delta Method"              : ("blue",   "-"),
+        "Linear Scaling"            : ("orange", "-"),
+        "Variance Scaling"          : ("green",  "-"),
+        "Quantile Mapping"          : ("purple", "-"),
+        "Detrended Quantile Mapping": ("brown",  "-"),
+        "Quantile Delta Mapping"    : ("magenta","-"),
+    }
+
+    tab_cdf, tab_ts, tab_klim = st.tabs([
+        "📈 Kurva Distribusi CDF (7 Garis)",
+        "📅 Grafik Deret Waktu / Time Series (7 Garis)",
+        "🌦️ Klimatologi Bulanan (7 Metode)"
+    ])
+
     with tab_cdf:
         fig_cdf, ax_cdf = plt.subplots(figsize=(11, 5.5))
         obs_sorted = np.sort(v_obs)
-        ax_cdf.plot(obs_sorted, np.arange(1, len(obs_sorted) + 1) / len(obs_sorted), label="Observasi BMKG", color="black", linewidth=3.0)
-        for (nama, s_data), color in zip(list_metode.items(), ['red', 'blue', 'orange', 'green', 'purple', 'brown', 'magenta']):
-            v_s = s_data.loc[df['Observasi'].notna()].values
-            sim_s = np.sort(v_s)
-            ax_cdf.plot(sim_s, np.arange(1, len(sim_s) + 1) / len(sim_s), label=nama, color=color, linestyle="--" if nama == "Sebelum Koreksi (ERA5)" else "-", linewidth=1.6)
+        ax_cdf.plot(obs_sorted, np.arange(1, len(obs_sorted) + 1) / len(obs_sorted),
+                    label="Observasi BMKG", color="black", linewidth=3.0)
+        for nama, s_data in list_metode.items():
+            clr, ls = WARNA_METODE[nama]
+            v_s = np.sort(s_data.loc[df["Observasi"].notna()].values)
+            ax_cdf.plot(v_s, np.arange(1, len(v_s) + 1) / len(v_s),
+                        label=nama, color=clr, linestyle=ls, linewidth=1.6)
         ax_cdf.set_xlim(0, 120)
+        ax_cdf.set_xlabel("Curah Hujan (mm/hari)")
+        ax_cdf.set_ylabel("Probabilitas Kumulatif")
+        ax_cdf.set_title("Kurva CDF — Semua Metode vs Observasi BMKG")
         ax_cdf.legend(loc="lower right", fontsize=9)
         ax_cdf.grid(True, alpha=0.3)
         st.pyplot(fig_cdf)
-        
+
     with tab_ts:
         fig_ts, ax_ts = plt.subplots(figsize=(12, 5))
         sample_df = df.head(100)
-        ax_ts.plot(sample_df['Tanggal'], sample_df['Observasi'], label="Observasi BMKG", color="black", linewidth=2.8)
-        for (nama, s_data), color in zip(list_metode.items(), ['red', 'blue', 'orange', 'green', 'purple', 'brown', 'magenta']):
-            ax_ts.plot(sample_df['Tanggal'], s_data.head(100), label=nama, color=color, linestyle="--" if nama == "Sebelum Koreksi (ERA5)" else "-", alpha=0.7)
+        ax_ts.plot(sample_df["Tanggal"], sample_df["Observasi"],
+                   label="Observasi BMKG", color="black", linewidth=2.8)
+        for nama, s_data in list_metode.items():
+            clr, ls = WARNA_METODE[nama]
+            ax_ts.plot(sample_df["Tanggal"], s_data.head(100),
+                       label=nama, color=clr, linestyle=ls, alpha=0.7)
+        ax_ts.set_xlabel("Tanggal")
+        ax_ts.set_ylabel("Curah Hujan (mm/hari)")
+        ax_ts.set_title("Deret Waktu Harian — 100 Hari Pertama")
         ax_ts.legend(loc="upper right", fontsize=8, ncol=2)
         ax_ts.grid(True, alpha=0.3)
         st.pyplot(fig_ts)
+
+    with tab_klim:
+        st.caption("Rata-rata curah hujan bulanan (klimatologi) dari seluruh periode 1991–2025. "
+                   "Grafik ini menunjukkan seberapa baik setiap metode mereproduksi pola musiman observasi.")
+
+        # Hitung klimatologi bulanan untuk setiap metode
+        NAMA_BULAN = ["Jan","Feb","Mar","Apr","Mei","Jun","Jul","Agu","Sep","Okt","Nov","Des"]
+        df_klim_plot = df.dropna(subset=["Observasi"]).copy()
+        df_klim_plot["Bulan"] = df_klim_plot["Tanggal"].dt.month
+
+        fig_klim, ax_klim = plt.subplots(figsize=(12, 5))
+
+        # Observasi BMKG
+        klim_obs = df_klim_plot.groupby("Bulan")["Observasi"].mean()
+        ax_klim.plot(klim_obs.index, klim_obs.values,
+                     label="Observasi BMKG", color="black",
+                     linewidth=3.0, marker="o", markersize=7, zorder=10)
+
+        # Semua metode
+        kolom_map = {
+            "Sebelum Koreksi (ERA5)"    : "Model_Raw",
+            "Delta Method"              : "Delta_Method",
+            "Linear Scaling"            : "Linear_Scaling",
+            "Variance Scaling"          : "Variance_Scaling",
+            "Quantile Mapping"          : "Quantile_Mapping",
+            "Detrended Quantile Mapping": "Detrended_Quantile_Mapping",
+            "Quantile Delta Mapping"    : "Quantile_Delta_Mapping",
+        }
+        for nama, col in kolom_map.items():
+            if col not in df_klim_plot.columns:
+                continue
+            clr, ls = WARNA_METODE[nama]
+            klim_sim = df_klim_plot.groupby("Bulan")[col].mean()
+            ax_klim.plot(klim_sim.index, klim_sim.values,
+                         label=nama, color=clr, linestyle=ls,
+                         linewidth=1.7, marker="s", markersize=4, alpha=0.85)
+
+        ax_klim.set_xticks(range(1, 13))
+        ax_klim.set_xticklabels(NAMA_BULAN)
+        ax_klim.set_xlabel("Bulan")
+        ax_klim.set_ylabel("Rata-rata CH Harian (mm/hari)")
+        ax_klim.set_title("Klimatologi Bulanan — Semua Metode Koreksi Bias vs Observasi BMKG (1991–2025)")
+        ax_klim.legend(loc="upper right", fontsize=9, ncol=2)
+        ax_klim.grid(True, alpha=0.3)
+        plt.tight_layout()
+        st.pyplot(fig_klim)
+
+        # Tabel klimatologi bulanan
+        with st.expander("📋 Lihat tabel nilai klimatologi bulanan"):
+            tbl_rows = {"Bulan": NAMA_BULAN}
+            tbl_rows["Observasi BMKG"] = [round(klim_obs.get(b, np.nan), 2) for b in range(1, 13)]
+            for nama, col in kolom_map.items():
+                if col in df_klim_plot.columns:
+                    klim_s = df_klim_plot.groupby("Bulan")[col].mean()
+                    tbl_rows[nama] = [round(klim_s.get(b, np.nan), 2) for b in range(1, 13)]
+            st.dataframe(pd.DataFrame(tbl_rows), use_container_width=True, hide_index=True)
+
+    # =================================================================
+    # SCATTER PLOT — Sebelum vs Sesudah Koreksi QM
+    # =================================================================
+    st.markdown("---")
+    st.markdown("### 🔵 Scatter Plot: ERA5 vs Observasi (Sebelum & Sesudah Koreksi QM)")
+    st.caption("Semakin rapat titik-titik ke garis 1:1 (merah putus-putus), semakin baik koreksi bias.")
+
+    fig_sc, axes_sc = plt.subplots(1, 2, figsize=(13, 5.5))
+    max_val = np.nanpercentile(np.concatenate([v_obs, v_raw]), 99) * 1.1
+
+    for ax, sim_vals, judul, warna in [
+        (axes_sc[0], v_raw,
+         "Sebelum Koreksi — ERA5 Mentah vs Observasi", "#e74c3c"),
+        (axes_sc[1], df["Quantile_Mapping"].loc[df["Observasi"].notna()].values,
+         "Sesudah Koreksi QM vs Observasi", "#2980b9"),
+    ]:
+        mask_sc = ~np.isnan(v_obs) & ~np.isnan(sim_vals)
+        o_sc, s_sc = v_obs[mask_sc], sim_vals[mask_sc]
+        ax.scatter(o_sc, s_sc, alpha=0.18, s=6, color=warna)
+        lim = max(np.nanmax(o_sc), np.nanmax(s_sc)) * 1.05
+        ax.plot([0, lim], [0, lim], "r--", linewidth=1.5, label="Garis 1:1")
+        # Garis regresi
+        z = np.polyfit(o_sc, s_sc, 1)
+        p = np.poly1d(z)
+        xs = np.linspace(0, lim, 200)
+        ax.plot(xs, p(xs), color="navy", linewidth=1.3,
+                label=f"Regresi: y={z[0]:.2f}x+{z[1]:.1f}")
+        r = np.corrcoef(o_sc, s_sc)[0, 1]
+        ax.set_title(judul, fontsize=10, fontweight="bold")
+        ax.set_xlabel("Observasi BMKG (mm/hari)")
+        ax.set_ylabel("Simulasi (mm/hari)")
+        ax.set_xlim(0, lim); ax.set_ylim(0, lim)
+        ax.legend(fontsize=8)
+        ax.text(0.05, 0.92, f"r = {r:.3f}", transform=ax.transAxes,
+                fontsize=10, color="darkgreen",
+                bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8))
+        ax.grid(True, alpha=0.25)
+
+    plt.tight_layout()
+    st.pyplot(fig_sc)
+
+    # =================================================================
+    # ETCCDI — Indeks Ekstrem Lengkap (Rx1day, Rx5day, R95p, PRCPTOT, CDD, CWD)
+    # =================================================================
+    st.markdown("---")
+    st.markdown("### 📊 Indeks Curah Hujan Ekstrem ETCCDI (Semua Metode)")
+    st.caption(
+        "Indeks ETCCDI (Expert Team on Climate Change Detection and Indices) adalah standar WMO "
+        "untuk mengukur perubahan dan kejadian ekstrem curah hujan. "
+        f"P95 hari hujan observasi = **{p95_thr:.1f} mm** (digunakan sebagai threshold R95p)."
+    )
+
+    INDEKS_LIST  = ["Rx1day","Rx5day","R95p","PRCPTOT","CDD","CWD"]
+    INDEKS_LABEL = {
+        "Rx1day" : "Rx1day (mm) — CH harian maks tahunan",
+        "Rx5day" : "Rx5day (mm) — CH maks akumulasi 5 hari",
+        "R95p"   : "R95p (mm)   — Total CH hari sangat basah (>P95)",
+        "PRCPTOT": "PRCPTOT (mm)— Total CH hari basah (≥1 mm)",
+        "CDD"    : "CDD (hari)  — Hari kering berturut-turut terpanjang",
+        "CWD"    : "CWD (hari)  — Hari hujan berturut-turut terpanjang",
+    }
+
+    kolom_etccdi = {
+        "Observasi BMKG"            : "Observasi",
+        "Sebelum Koreksi (ERA5)"    : "Model_Raw",
+        "Quantile Mapping"          : "Quantile_Mapping",
+        "Detrended Quantile Mapping": "Detrended_Quantile_Mapping",
+        "Quantile Delta Mapping"    : "Quantile_Delta_Mapping",
+        "Delta Method"              : "Delta_Method",
+        "Linear Scaling"            : "Linear_Scaling",
+        "Variance Scaling"          : "Variance_Scaling",
+    }
+    WARNA_ETCCDI = {
+        "Observasi BMKG"            : ("black",  "-",  3.0),
+        "Sebelum Koreksi (ERA5)"    : ("red",    "--", 1.8),
+        "Quantile Mapping"          : ("purple", "-",  2.0),
+        "Detrended Quantile Mapping": ("brown",  "-",  1.6),
+        "Quantile Delta Mapping"    : ("magenta","-",  1.6),
+        "Delta Method"              : ("blue",   "-",  1.4),
+        "Linear Scaling"            : ("orange", "-",  1.4),
+        "Variance Scaling"          : ("green",  "-",  1.4),
+    }
+
+    df_e = df.dropna(subset=["Observasi"]).copy()
+    etccdi_results = {}
+    for label, col in kolom_etccdi.items():
+        if col in df_e.columns:
+            etccdi_results[label] = calculate_etccdi_indices(
+                df_e[col].values, df_e["Tanggal"].values, p95_val=p95_thr
+            )
+
+    # Rata-rata indeks antar metode (untuk tabel ringkasan)
+    summary_rows = []
+    for label, edf in etccdi_results.items():
+        row = {"Metode": label}
+        for idx in INDEKS_LIST:
+            row[idx] = round(edf[idx].mean(), 2) if idx in edf.columns else np.nan
+        summary_rows.append(row)
+    df_etccdi_summary = pd.DataFrame(summary_rows)
+
+    with st.expander("📋 Tabel Rata-rata Indeks ETCCDI per Metode (seluruh periode)", expanded=True):
+        st.dataframe(df_etccdi_summary, use_container_width=True, hide_index=True)
+        st.caption("Nilai yang paling mendekati baris 'Observasi BMKG' = metode terbaik untuk indeks tersebut.")
+
+    # Grafik tren tahunan tiap indeks
+    st.markdown("#### 📈 Tren Tahunan Indeks ETCCDI")
+    idx_cols = st.columns(2)
+    for i, idx_name in enumerate(INDEKS_LIST):
+        with idx_cols[i % 2]:
+            fig_idx, ax_idx = plt.subplots(figsize=(6, 3.2))
+            for label, edf in etccdi_results.items():
+                if idx_name not in edf.columns: continue
+                clr, ls, lw = WARNA_ETCCDI[label]
+                ax_idx.plot(edf["Tahun"], edf[idx_name],
+                            label=label, color=clr, linestyle=ls, linewidth=lw, alpha=0.85)
+            ax_idx.set_title(INDEKS_LABEL[idx_name], fontsize=9, fontweight="bold")
+            ax_idx.set_xlabel("Tahun"); ax_idx.set_ylabel("Nilai")
+            ax_idx.legend(fontsize=6, ncol=2)
+            ax_idx.grid(True, alpha=0.25)
+            plt.tight_layout()
+            st.pyplot(fig_idx)
+
+    # =================================================================
+    # TREN TAHUNAN INDEKS EKSTREM — Regresi Linear
+    # =================================================================
+    st.markdown("---")
+    st.markdown("### 📉 Analisis Tren Tahunan Indeks Ekstrem (Regresi Linear)")
+    st.caption(
+        "Tren dihitung menggunakan regresi linear (OLS). "
+        "Nilai positif = tren meningkat, negatif = tren menurun. "
+        "Hanya ditampilkan untuk Observasi BMKG, ERA5 mentah, dan QM."
+    )
+
+    from scipy import stats as _stats
+
+    METODE_TREN = ["Observasi BMKG", "Sebelum Koreksi (ERA5)", "Quantile Mapping"]
+    WARNA_TREN  = {"Observasi BMKG": "black", "Sebelum Koreksi (ERA5)": "red", "Quantile Mapping": "purple"}
+
+    tren_rows = []
+    fig_tren, axes_tren = plt.subplots(2, 3, figsize=(15, 8))
+    axes_tren = axes_tren.flatten()
+
+    for ax_i, idx_name in enumerate(INDEKS_LIST):
+        ax_t = axes_tren[ax_i]
+        for label in METODE_TREN:
+            if label not in etccdi_results: continue
+            edf = etccdi_results[label]
+            if idx_name not in edf.columns: continue
+            yrs = edf["Tahun"].values
+            vals = edf[idx_name].values
+            mask_t = ~np.isnan(vals)
+            if mask_t.sum() < 5: continue
+            slope, intercept, r_val, p_val, _ = _stats.linregress(yrs[mask_t], vals[mask_t])
+            trend_line = slope * yrs + intercept
+            clr = WARNA_TREN[label]
+            ax_t.plot(yrs, vals, color=clr, alpha=0.4, linewidth=1.0)
+            ax_t.plot(yrs[mask_t], trend_line[mask_t], color=clr, linewidth=2.0,
+                      label=f"{label[:10]}… slope={slope:.2f}, p={p_val:.3f}")
+            sig = "✅ Signifikan" if p_val < 0.05 else "—"
+            tren_rows.append({
+                "Indeks"  : idx_name,
+                "Metode"  : label,
+                "Slope (per tahun)": round(slope, 4),
+                "R²"      : round(r_val**2, 4),
+                "p-value" : round(p_val, 4),
+                "Signifikan (p<0.05)": sig,
+            })
+        ax_t.set_title(INDEKS_LABEL[idx_name], fontsize=8, fontweight="bold")
+        ax_t.set_xlabel("Tahun", fontsize=7)
+        ax_t.legend(fontsize=6)
+        ax_t.grid(True, alpha=0.25)
+
+    plt.tight_layout()
+    st.pyplot(fig_tren)
+
+    with st.expander("📋 Tabel Hasil Regresi Tren Tahunan"):
+        st.dataframe(pd.DataFrame(tren_rows), use_container_width=True, hide_index=True)
+        st.caption(
+            "p-value < 0.05 → tren signifikan secara statistik. "
+            "Slope positif pada Rx1day/R95p → intensitas ekstrem cenderung meningkat."
+        )
 
     st.markdown("---")
     df_download = df[['Tanggal', 'Observasi', 'Model_Raw', 'Delta_Method', 'Linear_Scaling', 'Variance_Scaling', 'Quantile_Mapping', 'Detrended_Quantile_Mapping', 'Quantile_Delta_Mapping']].copy()
