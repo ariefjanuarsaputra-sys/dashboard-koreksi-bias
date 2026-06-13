@@ -6,3 +6,4 @@ scikit-learn
 xarray
 openpyxl
 python-cmethods
+matplotlib
