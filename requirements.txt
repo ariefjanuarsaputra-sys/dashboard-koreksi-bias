@@ -5,4 +5,4 @@ plotly
 scikit-learn
 xarray
 openpyxl
-git+https://github.com/btschwertfeger/cmethods.git
+cmethods==0.1.0
